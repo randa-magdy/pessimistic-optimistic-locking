@@ -143,6 +143,7 @@ Imagine a university library where students can check out books:
   4. Now Student B can check it out
 
 **Advantage**: No conflicts - only one person has the book
+
 **Disadvantage**: Student B must wait, reducing library efficiency
 
 ### Optimistic Locking: The Google Docs Approach
@@ -158,6 +159,7 @@ Consider collaborative document editing:
   5. User B sees: "Document was updated by another user. Please review changes."
 
 **Advantage**: Both users can work simultaneously
+
 **Disadvantage**: Conflicts need to be resolved when they occur
 
 ## NestJS Implementation Examples
