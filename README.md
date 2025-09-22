@@ -945,3 +945,389 @@ sequenceDiagram
 async function transferMoney(fromId: string, toId: string, amount: number) {
   const transaction = await sequelize.transaction();
   try {
+    // Lock accounts in consistent order to prevent deadlocks
+    const accountIds = [fromId, toId].sort();
+    const accounts = await Account.findAll({
+      where: { id: accountIds },
+      lock: true,
+      transaction,
+      order: [['id', 'ASC']] // Consistent ordering
+    });
+    
+    const fromAccount = accounts.find(acc => acc.id === fromId);
+    const toAccount = accounts.find(acc => acc.id === toId);
+    
+    if (fromAccount.balance < amount) {
+      throw new Error('Insufficient funds');
+    }
+    
+    fromAccount.balance -= amount;
+    toAccount.balance += amount;
+    
+    await Promise.all([
+      fromAccount.save({ transaction }),
+      toAccount.save({ transaction })
+    ]);
+    
+    await transaction.commit();
+  } catch (error) {
+    await transaction.rollback();
+    throw error;
+  }
+}
+
+// ❌ Bad: Long-running transaction with external calls
+async function badTransferExample(fromId: string, toId: string, amount: number) {
+  const transaction = await sequelize.transaction();
+  try {
+    const account = await Account.findByPk(fromId, { lock: true, transaction });
+    
+    // ❌ External API call while holding lock
+    await this.notificationService.sendEmail(account.email, 'Transfer initiated');
+    
+    // ❌ Long processing while holding lock
+    await this.fraudDetectionService.analyzeTransfer(account, amount);
+    
+    // Lock held for too long!
+    account.balance -= amount;
+    await account.save({ transaction });
+    
+    await transaction.commit();
+  } catch (error) {
+    await transaction.rollback();
+    throw error;
+  }
+}
+
+// ✅ Good: Process external operations outside transaction
+async function goodTransferExample(fromId: string, toId: string, amount: number) {
+  // Pre-validation without locks
+  const account = await Account.findByPk(fromId);
+  if (!account || account.balance < amount) {
+    throw new Error('Invalid transfer');
+  }
+  
+  // External operations first
+  await this.fraudDetectionService.analyzeTransfer(account, amount);
+  
+  // Quick transaction with locks
+  const transaction = await sequelize.transaction();
+  try {
+    const lockedAccount = await Account.findByPk(fromId, { lock: true, transaction });
+    
+    // Final balance check (could have changed)
+    if (lockedAccount.balance < amount) {
+      throw new Error('Insufficient funds');
+    }
+    
+    lockedAccount.balance -= amount;
+    await lockedAccount.save({ transaction });
+    await transaction.commit();
+    
+    // Post-processing without locks
+    await this.notificationService.sendEmail(account.email, 'Transfer completed');
+  } catch (error) {
+    await transaction.rollback();
+    throw error;
+  }
+}
+```
+
+**Key Practices:**
+- Keep transaction duration minimal
+- Avoid external API calls within transactions
+- Use consistent lock ordering to prevent deadlocks
+- Set appropriate transaction timeouts
+- Monitor for lock contention and deadlocks
+
+### When to Use Optimistic Locking
+
+#### Ideal Scenarios
+1. **User Profile Management**
+   - Profile updates
+   - Settings changes
+   - Preferences modification
+
+2. **Content Management Systems**
+   - Blog post editing
+   - Comment updates
+   - Document collaboration
+
+3. **Configuration Management**
+   - Application settings
+   - Feature flags
+   - System configurations
+
+4. **Read-Heavy Applications**
+   - Analytics dashboards
+   - Reporting systems
+   - Catalog browsing
+
+#### Implementation Best Practices
+
+```typescript
+// ✅ Good: Comprehensive retry strategy
+class OptimisticUpdateService {
+  async updateWithRetry<T>(
+    updateFunction: () => Promise<T>,
+    maxRetries: number = 3,
+    baseDelayMs: number = 100
+  ): Promise<T> {
+    let lastError: Error;
+    
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        return await updateFunction();
+      } catch (error) {
+        lastError = error;
+        
+        if (this.isOptimisticLockError(error)) {
+          if (attempt < maxRetries - 1) {
+            // Exponential backoff with jitter
+            const delay = baseDelayMs * Math.pow(2, attempt) + 
+                         Math.random() * baseDelayMs;
+            await this.sleep(delay);
+            continue;
+          }
+        }
+        
+        throw error;
+      }
+    }
+    
+    throw new Error(`Operation failed after ${maxRetries} attempts: ${lastError.message}`);
+  }
+  
+  private isOptimisticLockError(error: Error): boolean {
+    return error.name === 'OptimisticLockError' || 
+           error.name === 'OptimisticLockVersionMismatchError' ||
+           error.message.includes('version');
+  }
+  
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}
+
+// ✅ Good: User-friendly error handling
+@Injectable()
+export class UserProfileService {
+  constructor(private optimisticService: OptimisticUpdateService) {}
+  
+  async updateProfile(userId: string, updates: ProfileUpdates): Promise<UpdateResult> {
+    try {
+      const user = await this.optimisticService.updateWithRetry(
+        () => this.performProfileUpdate(userId, updates),
+        3
+      );
+      
+      return {
+        success: true,
+        user,
+        message: 'Profile updated successfully'
+      };
+    } catch (error) {
+      if (this.isOptimisticLockError(error)) {
+        return {
+          success: false,
+          error: 'CONCURRENT_UPDATE',
+          message: 'Your profile was updated by another session. Please refresh and try again.',
+          shouldRefresh: true
+        };
+      }
+      
+      throw error;
+    }
+  }
+  
+  private async performProfileUpdate(userId: string, updates: ProfileUpdates): Promise<User> {
+    const user = await this.userRepository.findOne({ where: { id: userId } });
+    if (!user) throw new Error('User not found');
+    
+    Object.assign(user, updates);
+    return await this.userRepository.save(user);
+  }
+}
+
+// ✅ Good: Batching updates to reduce conflicts
+export class ConfigurationService {
+  async updateMultipleSettings(
+    updates: Array<{ key: string; value: any }>
+  ): Promise<void> {
+    // Group updates by potential conflicts
+    const groupedUpdates = this.groupUpdatesByScope(updates);
+    
+    // Process each group separately to minimize conflict scope
+    for (const group of groupedUpdates) {
+      await this.optimisticService.updateWithRetry(
+        () => this.updateSettingsGroup(group)
+      );
+    }
+  }
+  
+  private groupUpdatesByScope(updates: Array<{ key: string; value: any }>) {
+    // Implementation would group related settings together
+    // to update them atomically while minimizing conflict scope
+    return updates.reduce((groups, update) => {
+      const scope = this.getSettingScope(update.key);
+      if (!groups[scope]) groups[scope] = [];
+      groups[scope].push(update);
+      return groups;
+    }, {} as Record<string, Array<{ key: string; value: any }>>);
+  }
+}
+```
+
+**Key Practices:**
+- Implement robust retry mechanisms with exponential backoff
+- Provide clear user feedback for conflicts
+- Group related updates to minimize conflict scope
+- Use version fields consistently across your schema
+- Monitor conflict rates and adjust strategy accordingly
+
+### Hybrid Approaches
+
+#### Conditional Locking Strategy
+```typescript
+export class SmartLockingService {
+  async updateRecord(
+    id: string, 
+    updates: any, 
+    options: { 
+      highConflictExpected?: boolean;
+      criticalData?: boolean;
+    } = {}
+  ): Promise<any> {
+    
+    // Choose strategy based on context
+    if (options.criticalData || options.highConflictExpected) {
+      return this.updateWithPessimisticLocking(id, updates);
+    } else {
+      return this.updateWithOptimisticLocking(id, updates);
+    }
+  }
+  
+  private async updateWithPessimisticLocking(id: string, updates: any) {
+    // Implementation using pessimistic locking
+  }
+  
+  private async updateWithOptimisticLocking(id: string, updates: any) {
+    // Implementation using optimistic locking with retry
+  }
+}
+```
+
+#### Time-Based Strategy Selection
+```typescript
+export class AdaptiveLockingService {
+  private conflictRates = new Map<string, number>();
+  
+  async updateRecord(recordType: string, id: string, updates: any) {
+    const conflictRate = this.conflictRates.get(recordType) || 0;
+    
+    // Use pessimistic locking if conflict rate is high
+    if (conflictRate > 0.1) { // 10% conflict rate threshold
+      return this.pessimisticUpdate(id, updates);
+    } else {
+      try {
+        return await this.optimisticUpdate(id, updates);
+      } catch (error) {
+        if (this.isOptimisticLockError(error)) {
+          // Track conflict and potentially switch strategies
+          this.trackConflict(recordType);
+          throw error;
+        }
+        throw error;
+      }
+    }
+  }
+  
+  private trackConflict(recordType: string) {
+    const currentRate = this.conflictRates.get(recordType) || 0;
+    this.conflictRates.set(recordType, Math.min(currentRate + 0.01, 1.0));
+  }
+}
+```
+
+### Monitoring and Performance Considerations
+
+#### Performance Monitoring
+```typescript
+export class LockingMetricsService {
+  private metrics = {
+    pessimisticLocks: {
+      acquired: 0,
+      waitTime: [],
+      deadlocks: 0
+    },
+    optimisticLocks: {
+      conflicts: 0,
+      retries: 0,
+      successRate: 0
+    }
+  };
+  
+  trackPessimisticLock(waitTimeMs: number) {
+    this.metrics.pessimisticLocks.acquired++;
+    this.metrics.pessimisticLocks.waitTime.push(waitTimeMs);
+  }
+  
+  trackOptimisticConflict() {
+    this.metrics.optimisticLocks.conflicts++;
+  }
+  
+  getMetrics() {
+    return {
+      pessimistic: {
+        ...this.metrics.pessimisticLocks,
+        averageWaitTime: this.calculateAverage(this.metrics.pessimisticLocks.waitTime)
+      },
+      optimistic: {
+        ...this.metrics.optimisticLocks,
+        conflictRate: this.metrics.optimisticLocks.conflicts / 
+                     (this.metrics.optimisticLocks.conflicts + this.metrics.optimisticLocks.retries)
+      }
+    };
+  }
+}
+```
+
+## Conclusion
+
+Both pessimistic and optimistic locking strategies serve important roles in maintaining data consistency in concurrent systems. The choice between them depends on your specific use case, performance requirements, and conflict expectations.
+
+### Quick Decision Guide
+
+**Choose Pessimistic Locking when:**
+- Data consistency is critical (financial transactions)
+- Conflicts are frequent
+- You can't afford retry logic complexity
+- Short transaction duration is possible
+- Immediate consistency is required
+
+**Choose Optimistic Locking when:**
+- Conflicts are rare
+- High concurrency and performance are priorities
+- You can implement robust retry mechanisms
+- Users can tolerate occasional retry requests
+- Read-heavy workloads with occasional writes
+
+### Implementation Checklist
+
+**For Pessimistic Locking:**
+- ✅ Keep transactions as short as possible
+- ✅ Use consistent lock ordering to prevent deadlocks
+- ✅ Set appropriate transaction timeouts
+- ✅ Monitor for lock contention
+- ✅ Avoid external API calls within transactions
+
+**For Optimistic Locking:**
+- ✅ Implement robust retry mechanisms
+- ✅ Use exponential backoff with jitter
+- ✅ Provide clear user feedback for conflicts
+- ✅ Monitor conflict rates
+- ✅ Consider version field indexing for performance
+
+Remember that these strategies are not mutually exclusive. Many applications successfully use both approaches for different types of operations within the same system, choosing the most appropriate strategy based on the specific requirements of each use case.
+
+The key to success is understanding your application's access patterns, performance requirements, and consistency needs, then implementing the appropriate strategy with proper error handling and monitoring.
